@@ -61,6 +61,9 @@ def parse_received_data_emby(received_data):
     main_ep_info = extra_data['mainEpInfo']
     episodes_info = extra_data.get('episodesInfo') or []
     playlist_info = extra_data.get('playlistInfo') or []
+    logger.info(f'Received: mainEpInfo.Type={main_ep_info.get("Type")}, episodes_info count={len(episodes_info)}, playlist_info count={len(playlist_info)}')
+    if playlist_info:
+        logger.info(f'First playlist item: {playlist_info[0] if playlist_info else "empty"}')
     # 随机播放剧集媒体库时，油猴没获取其他集的 Emby 标题，导致第一集回传数据失败，暂不处理。
     emby_title = main_ep_to_title(main_ep_info) if not playlist_info else None
     intro_time = main_ep_intro_time(main_ep_info)
@@ -161,8 +164,7 @@ def parse_received_data_emby(received_data):
     if is_strm and not is_http_source:
         if strm_direct:
             mount_disk_mode = True
-        hint = '\nyou may want to set strm_direct_host in ini' if not strm_direct else ''
-        logger.info(f'{source_path=}{hint}')
+        logger.info(f'{source_path=}')
 
     if mount_disk_mode:  # 肯定不会是 http
         if is_strm:
@@ -224,6 +226,26 @@ def parse_received_data_emby(received_data):
     media_basename = os.path.basename(media_path)
     size = int(media_source_info.get('Size', 0)) or 0
 
+    # 下载封面到 /tmp，用于 cover-art-file 属性显示（仅音频）
+    # 使用固定文件名 current_cover.jpg，这样切歌时直接覆盖该文件
+    # mpv-mpris 会自动检测到文件变化并更新系统媒体控件的封面
+    cover_art_file = ''
+    is_audio = main_ep_info.get('Type') == 'Audio'
+    try:
+        image_tag = (main_ep_info.get('ImageTags') or {}).get('Primary')
+        if is_audio and image_tag:
+            tmp_dir = os.path.join(configs.cwd, '.tmp')
+            os.makedirs(tmp_dir, exist_ok=True)
+            art_path = os.path.join(tmp_dir, 'current_cover.jpg')
+            art_url = f'{scheme}://{netloc}{extra_str}/Items/{item_id}/Images/Primary?tag={image_tag}'
+            if api_key:
+                art_url = f"{art_url}&api_key={api_key}"
+            requests_urllib(art_url, save_path=art_path, timeout=8, retry=2, silence=True)
+            if os.path.exists(art_path):
+                cover_art_file = art_path
+    except Exception as e:
+        logger.warn(f'cover download failed: {e}')
+
     result = dict(
         server=server,
         mount_disk_mode=mount_disk_mode,
@@ -260,6 +282,7 @@ def parse_received_data_emby(received_data):
         is_http_direct_strm=is_http_direct_strm,
         sub_inner_idx=sub_inner_idx,
         size=size,
+        cover_art_file=cover_art_file,
     )
     return result
 
@@ -429,6 +452,12 @@ def list_playlist_or_mix_s0(data):
 def list_episodes(data: dict):
     if data['server'] == 'plex':
         return list_episodes_plex(data)
+    
+    # 保存 playlist_info 的深拷贝以防止在函数执行中被修改（data.update会清空不在main_ep_info中的键）
+    import copy
+    playlist_info_backup = copy.deepcopy(data.get('playlist_info'))
+    logger.info(f'list_episodes START: playlist_info_backup={type(playlist_info_backup)}, len={len(playlist_info_backup) if isinstance(playlist_info_backup, list) else "N/A"}')
+    
     scheme = data['scheme']
     netloc = data['netloc']
     api_key = data['api_key']
@@ -441,14 +470,17 @@ def list_episodes(data: dict):
     headers = {'accept': 'application/json', }
     headers.update(data['headers'])
 
-    playlist_info = data.get('playlist_info')
-    playlist_info and logger.info('playlist_info found, skip version filter and pretty title')
+    playlist_info = playlist_info_backup
+    logger.info(f'list_episodes: playlist_info received, type={type(playlist_info)}, len={len(playlist_info) if isinstance(playlist_info, list) else "N/A"}')
     main_ep_info = data.get('main_ep_info') or requests_urllib(
         f'{scheme}://{netloc}{extra_str}/Users/{user_id}/Items/{data["item_id"]}',
         params=params, headers=headers, get_json=True)
 
     def fill_data_type_provider_ids(): # sync trakt required
         data.update(main_ep_info)
+        # 恢复 playlist_info 备份，因为 main_ep_info 中不包含该键
+        if playlist_info_backup is not None:
+            data['playlist_info'] = playlist_info_backup
         return data
 
     # if video is movie
@@ -751,16 +783,33 @@ def list_episodes(data: dict):
             intro_end=end_data.get(unique_key),
             order=order,
             sub_inner_idx=sub_inner_idx,
+            # 存储封面相关信息，供播放时按需下载
+            item_id_for_cover=item_id,
+            image_tag_for_cover=(item.get('ImageTags') or {}).get('Primary'),
+            scheme_for_cover=scheme,
+            netloc_for_cover=netloc,
+            extra_str_for_cover=extra_str,
+            api_key_for_cover=api_key,
         ))
         return result
 
-    if playlist_info:
+    if playlist_info_backup:
+        logger.info(f'Before chunk_list: playlist_info_backup type={type(playlist_info)}, len={len(playlist_info)}')
+        # 确保 playlist_info 还是我们保存的备份（防止被data.update清空）
+        playlist_info = playlist_info_backup  # 直接用备份
+        if playlist_info is None:
+            logger.error(f'playlist_info_backup is None, using empty list')
+            playlist_info = []
         # jellyfin 花絮 疑似也会被当作播放列表数据。
         def chunk_list(lst, chunk_size):
             for i in range(0, len(lst), chunk_size):
                 yield lst[i:i + chunk_size]
         # 限制随机播放列表条目数量避免 HTTP Error 414: URI Too Long
-        ids = [ep['Id'] for ep in playlist_info][:200]
+        logger.info(f'Before extracting ids: playlist_info type={type(playlist_info)}, len={len(playlist_info) if isinstance(playlist_info, list) else "N/A"}')
+        valid_items = [ep for ep in playlist_info if isinstance(ep, dict) and ep.get('Id')]
+        if len(valid_items) != len(playlist_info):
+            logger.info(f'playlist_info contains invalid items: valid={len(valid_items)}, total={len(playlist_info)}')
+        ids = [ep['Id'] for ep in valid_items]
         _eps_parts = []
         for _ids in chunk_list(ids, 200):
             params.update({'Fields': 'MediaSources,Path,ProviderIds',

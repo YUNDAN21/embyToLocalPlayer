@@ -95,6 +95,10 @@ def mpv_player_start(cmd, start_sec=None, sub_file=None, media_title=None, get_s
             cmd.append(f'--start={start_sec}')
     if is_darwin:
         cmd.append('--focus-on=open')
+    # 设置封面文件供系统媒体控件显示（新版 mpv-mpris 支持该参数）
+    cover_art_file = data.get('cover_art_file') if isinstance(data, dict) else None
+    if cover_art_file:
+        cmd.append(f'--cover-art-file={cover_art_file}')
     cmd.append(fr'--input-ipc-server={cmd_pipe}')
     cmd.append('--script-opts-append=autoload-disabled=yes')
     if configs.fullscreen:
@@ -172,8 +176,14 @@ def playlist_add_mpv(mpv: MPV, data, eps_data=None, limit=10):
         logger.error('mpv not found skip playlist_add_mpv')
         return {}
     episodes = eps_data or list_episodes(data)
+    logger.info(f'[cover] playlist_add_mpv: episodes count={len(episodes)}, storing to mpv.playlist_episodes')
     is_iina = getattr(mpv, 'is_iina')
     mount_disk_mode = data['mount_disk_mode']
+    
+    # 保存 episodes 到 mpv 对象，供切换歌曲时按需下载封面
+    mpv.playlist_episodes = episodes
+    logger.info(f'[cover] mpv.playlist_episodes stored, verify: len={len(getattr(mpv, "playlist_episodes", []))}')
+    
     # 检查是否是新版loadfile命令
     # https://github.com/mpv-player/mpv/commit/c678033
     new_loadfile_cmd = False
@@ -293,6 +303,45 @@ def stop_sec_mpv(mpv: MPV, stop_sec_only=True, **_):
             name_total_sec_dict[_t] = total_sec
             if '.strm' in _t:
                 logger.info(f'mpv: get strm file {total_sec=}')
+        
+        # 切歌时更新封面：仅音频类型下载封面，覆盖 current_cover.jpg
+        # mpv-mpris 会自动检测到文件变化并更新系统媒体控件的封面
+        try:
+            media_title = mpv.command('get_property', 'media-title')
+            playlist_episodes = getattr(mpv, 'playlist_episodes', [])
+            
+            target_ep = None
+            for ep in playlist_episodes:
+                if ep.get('media_title') == media_title:
+                    target_ep = ep
+                    break
+            
+            # 只处理音频类型
+            if target_ep and target_ep.get('Type') == 'Audio':
+                image_tag = target_ep.get('image_tag_for_cover')
+                item_id = target_ep.get('item_id_for_cover')
+                if image_tag and item_id:
+                    tmp_dir = os.path.join(configs.cwd, '.tmp')
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    art_path = os.path.join(tmp_dir, 'current_cover.jpg')
+                    
+                    scheme = target_ep.get('scheme_for_cover')
+                    netloc = target_ep.get('netloc_for_cover')
+                    extra_str = target_ep.get('extra_str_for_cover', '')
+                    api_key = target_ep.get('api_key_for_cover')
+                    
+                    art_url = f'{scheme}://{netloc}{extra_str}/Items/{item_id}/Images/Primary?tag={image_tag}'
+                    if api_key:
+                        art_url = f"{art_url}&api_key={api_key}"
+                    
+                    try:
+                        from utils.net_tools import requests_urllib
+                        requests_urllib(art_url, save_path=art_path, timeout=8, retry=2, silence=True)
+                        logger.info(f'[cover] cover updated for: {media_title}')
+                    except Exception as e:
+                        logger.warn(f'[cover] download failed for {media_title}: {e}')
+        except Exception as e:
+            logger.warn(f'[cover] file-loaded exception: {e}')
 
     while True:
         try:

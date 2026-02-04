@@ -266,6 +266,10 @@ def start_play(data):
     if player_is_running:
         logger.error('player_is_running, skip. You may want to disable one_instance_mode, see detail in config file')
         return
+    
+    # 保存 playlist_info 的备份，以防在 list_episodes 执行过程中被清空
+    playlist_info_backup = data.get('playlist_info')
+    
     file_path = data['file_path']
     start_sec = data['start_sec']
     sub_file = data['sub_file']
@@ -292,6 +296,10 @@ def start_play(data):
             player_manager.start_player(cmd=cmd, start_sec=start_sec, sub_file=sub_file, media_title=media_title,
                                         mount_disk_mode=mount_disk_mode, data=data)
             eps_data = eps_data_thread.join()
+            # 恢复 playlist_info 备份以防它在 list_episodes 中被清空
+            if playlist_info_backup is not None:
+                data['playlist_info'] = playlist_info_backup
+                logger.info(f'Restored playlist_info backup with {len(playlist_info_backup)} items')
             player_manager.playlist_add(eps_data=eps_data)
             player_manager.update_playlist_time_loop()
             player_manager.update_playback_for_eps()
