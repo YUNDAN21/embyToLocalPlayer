@@ -827,16 +827,41 @@
         // const listPlayBtn = e.target.closest('button.listItem[data-id="resume"][data-action="custom"]');
         // const listShuffleBtn = e.target.closest('button.listItem[data-id="shuffle"][data-action="custom"]');
 
-        // 列表播放：顺序 vs 随机
+        // 列表播放：顺序 vs 随机（仅音乐媒体库）
         if (listPlayBtn) {
             const container = e.target.closest('div[is="emby-itemscontainer"]');
             const isShuffle = listPlayBtn.matches('button.btnShuffle');
-            logger.info('🎬 List play button clicked:', { isShuffle }, listPlayBtn, container);
+            
+            // 从 URL 的 hash 部分提取 parentId 或 id
+            const urlHash = window.location.hash; // 例如：#!/item?id=9849&serverId=xxx 或 #!/music?parentId=xxx
+            const parentIdMatch = urlHash.match(/[?&]parentId=([a-zA-Z0-9]+)/);
+            const idMatch = urlHash.match(/[?&]id=([a-zA-Z0-9]+)/);
+            const libraryId = parentIdMatch ? parentIdMatch[1] : (idMatch ? idMatch[1] : null);
+            
+            if (!libraryId) {
+                logger.info('🎬 List play button clicked, but no id/parentId in URL, skipping.');
+                return;
+            }
+            
+            // 先阻止默认行为，避免双重播放
             e.preventDefault();
             e.stopImmediatePropagation();
-
+            
             (async () => {
                 try {
+                    // 获取项目信息，判断媒体库类型
+                    const userId = ApiClient._serverInfo.UserId;
+                    const libraryInfo = await ApiClient.getItem(userId, libraryId);
+                    const collectionType = libraryInfo.Type;
+                    
+                    logger.info('🎬 List play button clicked:', libraryInfo);
+                    
+                    // 只有音乐媒体库才触发列表播放
+                    if (collectionType !== 'music' && collectionType != 'Playlist') {
+                        logger.info(`'🎬 Not a music library, skipping list play logic.${collectionType}'`);
+                        return;
+                    }
+                    
                     // 目前随机/顺序共用处理，后续可在此分支扩展
                     if (isShuffle) {
                         await handleListPlay(container, true);
